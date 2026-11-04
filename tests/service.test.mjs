@@ -1,0 +1,132 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-bridge-test-'));
+process.env.CODEX_HOME = path.join(temp, 'codex-home');
+const THREAD = '01a1a447-735f-7c70-bc41-421df530f753';
+fs.mkdirSync(path.join(process.env.CODEX_HOME, 'sessions/2026/11/04'), { recursive: true });
+fs.writeFileSync(path.join(process.env.CODEX_HOME, 'sessions/2026/11/04', `rollout-2026-11-04T09-58-28-${THREAD}.jsonl`), [
+  { type: 'session_meta', payload: { id: THREAD, cwd: temp, timestamp: '2026-11-04T01:58:28Z', source: 'exec' } },
+  { type: 'event_msg', payload: { type: 'user_message', message: 'Reply with exactly: pong' } },
+  { type: 'turn_context', payload: { cwd: temp, model: 'gpt-test', effort: 'low', sandbox_policy: { type: 'read-only' } } },
+].map(line => JSON.stringify(line)).join('\n') + '\n');
+fs.writeFileSync(path.join(process.env.CODEX_HOME, '.codex-global-state.json'), JSON.stringify({
+  'local-projects': { p1: { id: 'p1', name: 'Alpha', rootPaths: [temp] }, p2: { id: 'p2', name: 'Beta', rootPaths: [path.join(temp, 'beta')] } },
+  'project-order': ['p2', 'p1'], 'selected-project': { type: 'local', projectId: 'p1' },
+}));
+fs.mkdirSync(path.join(temp, 'beta'));
+
+const { createService } = await import('../service/service.mjs');
+const { codexRunner, buildArgs, sessions, threadContext, threadLocked, commandText, THREAD_OPEN } = await import('../lib/codex.mjs');
+
+function makeService(name, extra = {}) {
+  const state = path.join(temp, name);
+  let service;
+  const runner = codexRunner({ state, onChange: () => service?.runnerChanged(), binary: () => process.execPath, prefix: [path.join(here, 'fake-codex.mjs')] });
+  service = createService({ state, runner, ...extra });
+  const call = (method, params = {}) => service.methods[method]({ client: 'alpha', ...params });
+  return { service, call };
+}
+const base = { workspace: temp };
+
+test('jobs run, answer, and stay with the client that started them', async t => {
+  const { service, call } = makeService('run'); t.after(() => service.close());
+  const one = await call('start', { ...base, prompt: 'hello', requestId: 'r1', title: 'Greeter' });
+  const again = await call('start', { ...base, prompt: 'hello', requestId: 'r1' });
+  assert.equal(again.jobId, one.jobId, 'the same requestId never starts a second run');
+  const waited = await call('wait', { jobIds: [one.jobId], timeoutMs: 8000 });
+  assert.equal(waited.reason, 'ended');
+  assert.equal(waited.jobs[0].result, 'answer: hello');
+  assert.equal(waited.jobs[0].prompt, 'hello', 'an ended job comes back whole');
+  assert.match(waited.jobs[0].sessionId, /^[0-9a-f-]{36}$/);
+  await assert.rejects(service.methods.status({ client: 'beta', jobId: one.jobId }), { code: 'bridge/job' });
+  assert.deepEqual((await service.methods.list({ client: 'beta' })).jobs, []);
+  assert.deepEqual(waited.jobs[0].settings, { workspace: temp, model: 'gpt-config', effort: 'medium', sandbox: 'workspace-write' }, 'what config.toml filled in is read back from the thread');
+  const pinned = await call('start', { ...base, sandbox: 'read-only', prompt: 'pinned', requestId: 'r2' });
+  assert.equal((await call('wait', { jobIds: [pinned.jobId], timeoutMs: 8000 })).jobs[0].settings.sandbox, 'read-only', 'a passed setting stays');
+  const other = await service.methods.start({ client: 'beta', ...base, prompt: 'hello', requestId: 'r1' });
+  assert.notEqual(other.jobId, one.jobId, 'request IDs are per client');
+  await assert.rejects(call('start', { ...base, client: 'Bad Name', prompt: 'x', requestId: 'x' }), { code: 'bridge/client' });
+});
+
+test('settings are checked, and a Codex project means its root folder', async t => {
+  const { service, call } = makeService('settings'); t.after(() => service.close());
+  await assert.rejects(call('start', { workspace: path.join(temp, 'missing'), prompt: 'x', requestId: 'a' }), { code: 'bridge/invalid' });
+  await assert.rejects(call('start', { ...base, sandbox: 'yolo', prompt: 'x', requestId: 'b' }), { code: 'bridge/invalid' });
+  await assert.rejects(call('start', { ...base, project: 'nope', prompt: 'x', requestId: 'c' }), { code: 'bridge/invalid' });
+  const job = await call('start', { project: 'p2', workspace: 'ignored', prompt: 'x', requestId: 'd' });
+  assert.equal(job.settings.workspace, path.join(temp, 'beta'));
+  const catalog = await call('catalog');
+  assert.deepEqual(catalog.projects.map(project => project.name), ['Beta', 'Alpha']);
+  assert.equal(catalog.defaults.project, 'p1');
+});
+
+test('failures and cancellations end the job with a reason', async t => {
+  const { service, call } = makeService('ends'); t.after(() => service.close());
+  const failed = await call('start', { ...base, prompt: 'please fail', requestId: 'f' });
+  assert.equal((await call('wait', { jobIds: [failed.jobId], timeoutMs: 8000 })).jobs[0].error, 'fake failure');
+  const slow = await call('start', { ...base, prompt: 'slow work', requestId: 's' });
+  for (let i = 0; i < 40 && (await call('status', { jobId: slow.jobId })).status !== 'running'; i++) await new Promise(resolve => setTimeout(resolve, 100));
+  await call('cancel', { jobId: slow.jobId });
+  assert.equal((await call('wait', { jobIds: [slow.jobId], timeoutMs: 10000 })).jobs[0].status, 'cancelled');
+});
+
+test('resume keeps the thread\'s own settings instead of config.toml', async t => {
+  const { service, call } = makeService('resume'); t.after(() => service.close());
+  assert.deepEqual(threadContext(THREAD), { workspace: temp, model: 'gpt-test', effort: 'low', sandbox: 'read-only', source: 'exec' });
+  assert.equal(sessions({ query: 'pong' })[0].sessionId, THREAD);
+  const job = await call('resume', { sessionId: THREAD, prompt: 'again', requestId: 'x1' });
+  const waited = await call('wait', { jobIds: [job.jobId], timeoutMs: 8000 });
+  assert.equal(waited.jobs[0].result, 'resumed: again');
+  assert.match(waited.jobs[0].activity[0].text, /sandbox_mode="read-only"/);
+  assert.deepEqual(buildArgs({ settings: { workspace: 'W', model: 'm' }, threadId: 'T' }),
+    ['exec', 'resume', '--json', '--skip-git-repo-check', '-c', 'approval_policy="never"', '-c', 'model="m"', 'T', '-']);
+  assert.equal(commandText(String.raw`"C:\WINDOWS\powershell.exe" -Command "Get-Content -LiteralPath 'D:\\A B\\x.md'"`), String.raw`Get-Content -LiteralPath 'D:\A B\x.md'`);
+});
+
+test('a thread the Codex app holds is refused with a clear reason', async t => {
+  const held = new Set([THREAD]);
+  const { service, call } = makeService('locked', { threadLock: id => held.has(id) }); t.after(() => service.close());
+  await assert.rejects(call('resume', { sessionId: THREAD, prompt: 'again', requestId: 'l1' }), { code: 'codex/thread-open', message: THREAD_OPEN });
+  assert.deepEqual((await call('list')).jobs, [], 'a refused resume leaves no job behind');
+  held.clear();
+  const raced = await call('resume', { sessionId: THREAD, prompt: 'locked', requestId: 'l2' });
+  assert.equal((await call('wait', { jobIds: [raced.jobId], timeoutMs: 8000 })).jobs[0].error, THREAD_OPEN, 'losing the race to the app reads the same');
+  assert.equal(threadLocked(THREAD), false, 'no lock file means free');
+  fs.mkdirSync(path.join(process.env.CODEX_HOME, 'thread-writer-locks'), { recursive: true });
+  fs.writeFileSync(path.join(process.env.CODEX_HOME, 'thread-writer-locks', THREAD + '.lock'), '');
+  assert.equal(threadLocked(THREAD), false, 'a lock file nobody holds is free');
+});
+
+test('events answer as soon as something changed', async t => {
+  const { service, call } = makeService('events'); t.after(() => service.close());
+  const first = await call('events', { timeoutMs: 0 });
+  const pending = call('events', { afterCursor: first.cursor, timeoutMs: 8000 });
+  await call('start', { ...base, prompt: 'hi', requestId: 'e' });
+  const next = await pending;
+  assert.ok(next.cursor > first.cursor);
+  assert.equal(next.jobs.length, 1);
+});
+
+test('threads open in the Codex app only when asked, and never while a run writes them', async t => {
+  const opened = [];
+  const { service, call } = makeService('open', { codexApp: { open: id => { opened.push(id); return { opened: true }; } } }); t.after(() => service.close());
+  await assert.rejects(call('start', { ...base, mode: 'desktop', prompt: 'x', requestId: 'm' }), { code: 'bridge/invalid' }, 'mode is gone in protocol 2');
+  const slow = await call('start', { ...base, prompt: 'slow a', requestId: 'a' });
+  const quick = await call('start', { ...base, prompt: 'b', requestId: 'b' });
+  await call('wait', { jobIds: [quick.jobId], timeoutMs: 8000 });
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.deepEqual(opened, [], 'an ended run is not opened by itself');
+  await call('open', { jobId: quick.jobId });
+  assert.deepEqual(opened, [(await call('status', { jobId: quick.jobId })).sessionId]);
+  await assert.rejects(call('open', { jobId: slow.jobId }), { code: 'bridge/open' });
+  await call('cancel', { jobId: slow.jobId });
+  await call('wait', { jobIds: [slow.jobId], timeoutMs: 8000 });
+});
+
+test.after(() => fs.rmSync(temp, { recursive: true, force: true }));
