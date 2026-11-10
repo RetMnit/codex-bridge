@@ -6,10 +6,10 @@ import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypt
 import { EventEmitter } from 'node:events';
 import { pathToFileURL } from 'node:url';
 import { STATE, VERSION, PROTOCOL, BridgeError, atomic, readJson, now, summary, terminal, clientOf } from '../lib/common.mjs';
-import { codexRunner, catalog, sessions, threadContext, threadLocked, openThread, projectList, SANDBOXES, THREAD_OPEN } from '../lib/codex.mjs';
+import { codexRunner, catalog, sessions, threadContext, threadLocked, threadOrigin, openThread, projectList, SANDBOXES, THREAD_OPEN, THREAD_ID } from '../lib/codex.mjs';
 
 const RETAIN_DAYS = 30, RETAIN_PER_CLIENT = 500;
-export function createService({ state = STATE, runner, codexApp = { open: openThread }, threadLock = threadLocked, clock = Date.now } = {}) {
+export function createService({ state = STATE, runner, codexApp = { open: openThread }, threadLock = threadLocked, origin = threadOrigin, clock = Date.now } = {}) {
   const file = path.join(state, 'jobs.json');
   const jobs = new Map((readJson(file, { jobs: [] }).jobs ?? []).map(job => [job.jobId, job]));
   const changes = new EventEmitter(); changes.setMaxListeners(200);
@@ -52,11 +52,23 @@ export function createService({ state = STATE, runner, codexApp = { open: openTh
     if (!job || job.client !== client) throw new BridgeError('bridge/job', 'Unknown jobId for this client');
     return job;
   };
+  // A client may delete a thread it started. Once its records are pruned (30 days),
+  // a thread started by the bridge (originator "codex-bridge") still counts, unless
+  // another client has records of it. The user's own threads never do.
+  const ownerProblem = (client, sessionId, originator) => {
+    const records = [...jobs.values()].filter(job => job.sessionId === sessionId);
+    if (records.some(job => job.client !== client)) return 'Another caller of the bridge has tasks on this thread';
+    if (records.some(job => !job.resumeOf)) return undefined;
+    if ((originator ?? origin(sessionId)?.originator) === 'codex-bridge') return undefined;
+    return records.length ? 'This thread was not started through the bridge; only resumed here' : 'This thread was not started through the bridge';
+  };
+  const deleting = new Set();
   function launch(client, params, settings, resumeOf) {
     const existing = [...jobs.values()].find(job => job.client === client && job.requestId === params.requestId);
     if (existing) return existing;
     if (resumeOf && [...jobs.values()].some(job => job.sessionId === resumeOf && !terminal(job.status))) throw new BridgeError('bridge/busy', 'This Codex thread already has a running task');
     if (resumeOf && threadLock(resumeOf)) throw new BridgeError('codex/thread-open', THREAD_OPEN);
+    if (resumeOf && deleting.has(resumeOf)) throw new BridgeError('bridge/busy', 'This Codex thread is being deleted');
     const job = {
       jobId: 'codex-' + randomUUID(), client, requestId: params.requestId,
       title: params.title || summary(params.prompt, 40), prompt: params.prompt, promptSummary: summary(params.prompt, 120),
@@ -77,7 +89,12 @@ export function createService({ state = STATE, runner, codexApp = { open: openTh
   const methods = {
     health: async () => ({ version: VERSION, protocol: PROTOCOL, pid: process.pid, active: [...jobs.values()].filter(job => !terminal(job.status)).length }),
     catalog: async () => catalog({ models: await models() }),
-    sessions: async params => ({ sessions: sessions(params) }),
+    // With `client`, each thread says whether that client may delete it.
+    sessions: async params => {
+      const client = params.client === undefined ? undefined : clientOf(params);
+      const found = sessions(params);
+      return { sessions: client ? found.map(item => ({ ...item, deletable: !ownerProblem(client, item.sessionId, item.originator) })) : found };
+    },
     start: async params => {
       const client = clientOf(params);
       task(params);
@@ -124,6 +141,34 @@ export function createService({ state = STATE, runner, codexApp = { open: openTh
       if (typeof params.prompt !== 'string' || !params.prompt.trim()) throw new BridgeError('bridge/invalid', 'prompt is required');
       await runner.steer(job, params.prompt);
       return view(job);
+    },
+    // Deletes threads the client started, through Codex, and the bridge's records of them.
+    delete: async params => {
+      const client = clientOf(params);
+      const ids = params.sessionIds;
+      if (!Array.isArray(ids) || !ids.length || ids.length > 100 || ids.some(id => typeof id !== 'string' || !THREAD_ID.test(id))) throw new BridgeError('bridge/invalid', 'sessionIds must be 1 to 100 Codex thread IDs');
+      const errors = [], allowed = [];
+      for (const id of new Set(ids)) {
+        const refuse = (code, message) => errors.push({ sessionId: id, code, message });
+        const problem = ownerProblem(client, id);
+        if (problem) refuse('bridge/not-owner', problem);
+        else if (deleting.has(id) || [...jobs.values()].some(job => job.sessionId === id && !terminal(job.status))) refuse('bridge/busy', 'This thread has a running task');
+        else if (threadLock(id)) refuse('codex/thread-open', 'The Codex app has this thread loaded; quit the Codex app completely, or delete it there');
+        else allowed.push(id);
+      }
+      if (!allowed.length) return { deleted: [], errors };
+      for (const id of allowed) deleting.add(id);
+      try {
+        const outcome = await runner.deleteThreads(allowed);
+        const gone = new Set(outcome.deleted);
+        for (const job of [...jobs.values()]) {
+          if (!gone.has(job.sessionId)) continue;
+          jobs.delete(job.jobId);
+          fs.rmSync(path.join(state, 'jobs', job.jobId), { recursive: true, force: true });
+        }
+        if (gone.size) changed();
+        return { deleted: outcome.deleted, errors: [...errors, ...outcome.errors] };
+      } finally { for (const id of allowed) deleting.delete(id); }
     },
     // Once the app loads a thread it keeps the writer lock until it quits and
     // resume is refused meanwhile, so callers open only when the user asks to look.

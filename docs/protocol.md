@@ -34,7 +34,7 @@ Every job method takes `client`, a short lowercase name of the caller (`agent-hu
 | --- | --- | --- |
 | `health` | — | `{ version, protocol, pid, active, instanceId }` |
 | `catalog` | — | `{ models: [{ id, name, efforts, defaultEffort }], permissions, projects: [{ id, name, root }], defaults: { model, effort, permission, project } }`; models are asked from Codex (the Codex app's cache file when it cannot be asked), the rest comes from the app's own files |
-| `sessions` | `query?`, `workspace?`, `limit?` | `{ sessions: [{ sessionId, createdAt, workspace, source, title }] }`, newest first |
+| `sessions` | `client?`, `query?`, `workspace?`, `limit?` | `{ sessions: [{ sessionId, createdAt, workspace, source, originator, title, deletable? }] }`, newest first; `query` matches the first prompt and the folder. With `client`, `deletable` says whether that client may `delete` the thread |
 | `start` | `client`, `requestId`, `prompt`, `title?`, `workspace` or `project`, `model?`, `effort?`, `sandbox?` | job |
 | `resume` | `client`, `requestId`, `sessionId`, `prompt`, `title?` | job; the thread keeps the folder, model, effort and sandbox it last ran with. Refused with `codex/thread-open` while the Codex app has the thread loaded (see below) |
 | `steer` | `client`, `jobId`, `prompt` | job; adds a message to the job's running turn, which Codex reads before its next step. Refused with `bridge/not-running` when the turn has not started yet or has ended (then `resume` the thread) |
@@ -44,6 +44,7 @@ Every job method takes `client`, a short lowercase name of the caller (`agent-hu
 | `events` | `client`, `afterCursor?`, `timeoutMs?` | `{ cursor, jobs }` as soon as anything changed after `afterCursor` |
 | `cancel` | `client`, `jobId` | job; Codex is asked to interrupt the turn, so the thread stays resumable |
 | `open` | `client`, `jobId` or `sessionId` | shows an ended run's thread in the Codex app; refused while a run writes it |
+| `delete` | `client`, `sessionIds` (1–100) | `{ deleted: [sessionId], errors: [{ sessionId, code, message }] }`; deletes threads through Codex, and the bridge's records of them (see below) |
 | `shutdown` | — | stops an idle service (refused while jobs run) |
 
 Runs are always hidden. Protocol 1's `mode` (`desktop` opened each ended run in the Codex app) is gone, and passing `mode` is refused with `bridge/invalid`.
@@ -51,6 +52,8 @@ Runs are always hidden. Protocol 1's `mode` (`desktop` opened each ended run in 
 A thread has one writer at a time: whichever process has it loaded. A run holds its thread only for the length of its turn, so an ended run's thread is free at once. The Codex app, once it has loaded a thread (through `open`, or the user opening it there), keeps the writer lock until the app quits. Switching to another thread or leaving it idle does not release it. Meanwhile `resume` of that thread is refused with `codex/thread-open`: continue it in the Codex app, or quit the app completely and resume again. A run that loses this race to the app fails with the same message. So callers `open` only when the user asks to look, and say what it costs. The lock check works on Windows; elsewhere a held thread is found only when the run fails.
 
 `sandbox`: `read-only`, `workspace-write` or `danger-full-access`; left out, Codex's `config.toml` decides for a new thread. Runs never ask for approval (`approval_policy="never"`), since nobody can answer one; a request Codex makes anyway is turned down and shown as a warning.
+
+`delete` removes a thread for good: Codex deletes its rollout and its own indexes, and the bridge drops every job record of it, so callers that mirror jobs drop the ones that disappear. A client may delete a thread it started; once those records are pruned, any thread the bridge started (`originator` `codex-bridge`) that no other client has records of. Threads the user started in the Codex app, or only resumed through the bridge, are refused with `bridge/not-owner`. Also refused per thread: `bridge/busy` while a task runs on it, `codex/thread-open` while the Codex app has it loaded, and `codex/thread-forked` while a fork of it exists (the message names the fork; threads deleted together are ordered so a fork goes first).
 
 A run lives in the service: when the service stops while a job runs, the job ends as `interrupted` and its thread can be resumed. `shutdown` is refused while jobs run, so an upgrade never does this.
 

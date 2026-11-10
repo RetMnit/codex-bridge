@@ -139,6 +139,56 @@ test('a thread the Codex app holds is refused with a clear reason', async t => {
   assert.equal(threadLocked(THREAD), false, 'a lock file nobody holds is free');
 });
 
+test('a client deletes the threads it started, with their records, and nothing else', async t => {
+  const held = new Set();
+  const { service, call } = makeService('delete', { threadLock: id => held.has(id) }); t.after(() => service.close());
+  const day = path.join(process.env.CODEX_HOME, 'sessions/2026/11/05');
+  fs.mkdirSync(day, { recursive: true });
+  const ids = { user: '01a1a447-0000-7000-8000-000000000001', pruned: '01a1a447-0000-7000-8000-000000000002', parent: '01a1a447-0000-7000-8000-000000000003', fork: '01a1a447-0000-7000-8000-000000000004' };
+  const rollout = (id, originator, extra = {}) => fs.writeFileSync(path.join(day, `rollout-2026-11-05T00-00-00-${id}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id, cwd: temp, timestamp: '2026-11-05T00:00:00Z', originator, ...extra } }) + '\n');
+  rollout(ids.user, 'Codex Desktop');
+  rollout(ids.pruned, 'codex-bridge');
+  rollout(ids.parent, 'codex-bridge');
+  rollout(ids.fork, 'codex-bridge', { forked_from_id: ids.parent });
+  const exists = id => fs.readdirSync(day).some(name => name.includes(id));
+
+  const mine = await call('start', { ...base, prompt: 'mine', requestId: 'd1' });
+  const thread = (await call('wait', { jobIds: [mine.jobId], timeoutMs: 8000 })).jobs[0].sessionId;
+  const theirs = await service.methods.start({ client: 'beta', ...base, prompt: 'theirs', requestId: 'd1' });
+  const other = (await service.methods.wait({ client: 'beta', jobIds: [theirs.jobId], timeoutMs: 8000 })).jobs[0].sessionId;
+
+  const listed = Object.fromEntries((await call('sessions', { limit: 50 })).sessions.map(item => [item.sessionId, item.deletable]));
+  assert.equal(listed[ids.user], false, "the user's own thread is not ours to delete");
+  assert.equal(listed[ids.pruned], true, 'a bridge thread whose records were pruned is');
+
+  const refused = await call('delete', { sessionIds: [ids.user, other, ids.parent] });
+  assert.deepEqual(refused.deleted, []);
+  assert.deepEqual(refused.errors.map(error => [error.sessionId, error.code]), [[ids.user, 'bridge/not-owner'], [other, 'bridge/not-owner'], [ids.parent, 'codex/thread-forked']]);
+  assert.match(refused.errors[2].message, new RegExp(ids.fork), 'the fork in the way is named');
+  assert.ok(exists(ids.user) && exists(ids.parent));
+
+  held.add(ids.pruned);
+  assert.equal((await call('delete', { sessionIds: [ids.pruned] })).errors[0].code, 'codex/thread-open');
+  held.clear();
+
+  const done = await call('delete', { sessionIds: [thread, ids.pruned, ids.parent, ids.fork] });
+  assert.deepEqual(done.errors, []);
+  assert.deepEqual(new Set(done.deleted), new Set([thread, ids.pruned, ids.parent, ids.fork]), 'a parent goes once its fork is gone');
+  assert.ok(!exists(ids.pruned) && !exists(ids.parent) && !exists(ids.fork));
+  await assert.rejects(call('status', { jobId: mine.jobId }), { code: 'bridge/job' }, 'the records of a deleted thread go with it');
+  assert.ok(!fs.existsSync(path.join(temp, 'delete', 'jobs', mine.jobId)));
+  assert.equal((await service.methods.status({ client: 'beta', jobId: theirs.jobId })).sessionId, other, "another client's records stay");
+
+  const slow = await call('start', { ...base, prompt: 'slow', requestId: 'd2' });
+  await running(call, slow.jobId);
+  const busy = (await call('status', { jobId: slow.jobId })).sessionId;
+  assert.equal((await call('delete', { sessionIds: [busy] })).errors[0].code, 'bridge/busy');
+  await call('cancel', { jobId: slow.jobId });
+  await call('wait', { jobIds: [slow.jobId], timeoutMs: 8000 });
+  await assert.rejects(call('delete', { sessionIds: ['nope'] }), { code: 'bridge/invalid' });
+  fs.rmSync(path.join(day, `rollout-2026-11-05T00-00-00-${ids.user}.jsonl`));
+});
+
 test('events answer as soon as something changed', async t => {
   const { service, call } = makeService('events'); t.after(() => service.close());
   const first = await call('events', { timeoutMs: 0 });

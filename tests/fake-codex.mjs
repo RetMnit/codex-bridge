@@ -45,6 +45,16 @@ const methods = {
     setImmediate(() => finish(turn, 'steered: ' + params.input[0].text));
     return { turnId: turn };
   },
+  // Removes the thread's rollout; refused while another rollout was forked from it.
+  'thread/delete': ({ threadId }) => {
+    const files = [];
+    const walk = directory => { for (const entry of fs.readdirSync(directory, { withFileTypes: true })) { const full = path.join(directory, entry.name); entry.isDirectory() ? walk(full) : files.push(full); } };
+    try { walk(path.join(process.env.CODEX_HOME, 'sessions')); } catch {}
+    const meta = file => { try { return JSON.parse(fs.readFileSync(file, 'utf8').split('\n')[0]).payload; } catch { return {}; } };
+    if (files.some(file => meta(file).forked_from_id === threadId)) throw { code: -32600, message: `cannot delete thread ${threadId}: forked history still references it` };
+    for (const file of files) if (file.endsWith(threadId + '.jsonl')) fs.rmSync(file);
+    return {};
+  },
   'turn/interrupt': params => {
     slow = undefined;
     setImmediate(() => send({ method: 'turn/completed', params: { threadId: thread, turn: { id: params.turnId, status: 'interrupted' } } }));

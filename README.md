@@ -1,6 +1,6 @@
 # Codex Bridge
 
-A small local service that lets any agent hand work to OpenAI Codex: start Codex turns (through `codex app-server`), resume earlier threads with their original settings, add a message to a running turn, watch progress, wait for answers and cancel. Runs are hidden; a thread opens in the Codex app only on request, since the app then keeps it locked against resumes until it quits. Each caller sees only its own jobs.
+A small local service that lets any agent hand work to OpenAI Codex: start Codex turns (through `codex app-server`), resume earlier threads with their original settings, add a message to a running turn, watch progress, wait for answers and cancel, and delete the threads it started (the Codex app cannot show those without loading each one). Runs are hidden; a thread opens in the Codex app only on request, since the app then keeps it locked against resumes until it quits. Each caller sees only its own jobs.
 
 ## Install
 
