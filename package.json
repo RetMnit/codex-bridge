@@ -1,6 +1,6 @@
 {
   "name": "@retmnit/codex-bridge",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "Local Codex task service: run, resume, steer, watch and cancel Codex turns for any agent.",

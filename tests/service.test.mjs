@@ -15,6 +15,13 @@ fs.writeFileSync(path.join(process.env.CODEX_HOME, 'sessions/2026/11/04', `rollo
   { type: 'event_msg', payload: { type: 'user_message', message: 'Reply with exactly: pong' } },
   { type: 'turn_context', payload: { cwd: temp, model: 'gpt-test', effort: 'low', sandbox_policy: { type: 'read-only' } } },
 ].map(line => JSON.stringify(line)).join('\n') + '\n');
+// Newer rollouts log the prompt only as a completed UserMessage item.
+const NEW_THREAD = '01a1a447-735f-7c70-bc41-421df530f754';
+fs.writeFileSync(path.join(process.env.CODEX_HOME, 'sessions/2026/11/04', `rollout-2026-11-04T08-00-00-${NEW_THREAD}.jsonl`), [
+  { type: 'session_meta', payload: { id: NEW_THREAD, cwd: temp, timestamp: '2026-11-04T00:00:00Z', source: 'vscode' } },
+  { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '# AGENTS.md instructions' }] } },
+  { type: 'event_msg', payload: { type: 'item_completed', item: { type: 'UserMessage', content: [{ type: 'text', text: 'Count the files' }] } } },
+].map(line => JSON.stringify(line)).join('\n') + '\n');
 fs.writeFileSync(path.join(process.env.CODEX_HOME, '.codex-global-state.json'), JSON.stringify({
   'local-projects': { p1: { id: 'p1', name: 'Alpha', rootPaths: [temp] }, p2: { id: 'p2', name: 'Beta', rootPaths: [path.join(temp, 'beta')] } },
   'project-order': ['p2', 'p1'], 'selected-project': { type: 'local', projectId: 'p1' },
@@ -108,6 +115,7 @@ test('resume keeps the thread\'s own settings instead of config.toml', async t =
   const { service, call } = makeService('resume'); t.after(() => service.close());
   assert.deepEqual(threadContext(THREAD), { workspace: temp, model: 'gpt-test', effort: 'low', sandbox: 'read-only', source: 'exec' });
   assert.equal(sessions({ query: 'pong' })[0].sessionId, THREAD);
+  assert.deepEqual(sessions({ query: 'count the' }).map(found => [found.sessionId, found.title]), [[NEW_THREAD, 'Count the files']]);
   const job = await call('resume', { sessionId: THREAD, prompt: 'again', requestId: 'x1' });
   const waited = await call('wait', { jobIds: [job.jobId], timeoutMs: 8000 });
   assert.equal(waited.jobs[0].result, 'resumed: again');
