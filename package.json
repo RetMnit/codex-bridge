@@ -1,9 +1,9 @@
 {
   "name": "@retmnit/codex-bridge",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "Local Codex task service: run, resume, watch and cancel `codex exec` jobs for any agent.",
+  "description": "Local Codex task service: run, resume, steer, watch and cancel Codex turns for any agent.",
   "engines": { "node": ">=22" },
   "exports": { "./client": "./lib/client.mjs", "./codex": "./lib/codex.mjs" },
   "scripts": { "test": "node --test tests/*.test.mjs", "setup": "node setup.mjs" }

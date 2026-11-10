@@ -17,6 +17,14 @@ export function createService({ state = STATE, runner, codexApp = { open: openTh
   const save = () => { clearTimeout(saveTimer); saveTimer = setTimeout(() => atomic(file, { jobs: [...jobs.values()] }), 50); };
   const changed = () => { cursor++; save(); changes.emit('change'); };
   runner ??= codexRunner({ state, onChange: changed });
+  // Codex's own model list, asked at most every ten minutes; the app's cache file when it cannot be asked.
+  let modelCache;
+  const models = async () => {
+    if (!modelCache || clock() - modelCache.at > 600000) {
+      try { modelCache = { at: clock(), list: await runner.models() }; } catch { return undefined; }
+    }
+    return modelCache.list;
+  };
 
   function settingsOf(input) {
     const text = (key, value) => { if (value !== undefined && (typeof value !== 'string' || !value.trim())) throw new BridgeError('bridge/invalid', 'Invalid ' + key); return value?.trim(); };
@@ -59,24 +67,23 @@ export function createService({ state = STATE, runner, codexApp = { open: openTh
     changed();
     return job;
   }
-  // Prompts, offsets and process IDs stay inside; `full` adds the prompt and every action.
+  // Prompts, process IDs and what older versions kept stay inside; `full` adds the prompt and every action.
   const view = (job, { full = false } = {}) => {
-    const { prompt, offset, pid, cancelRequested, lastMessage, lastError, activity, mode, appOpen, effectiveRead, ...rest } = job;
+    const { prompt, pid, cancelRequested, lastMessage, lastError, activity, offset, mode, appOpen, effectiveRead, ...rest } = job;
     return { ...rest, activity: full ? activity : activity.slice(-8), ...(full ? { prompt } : {}) };
   };
   const waitChange = ms => new Promise(resolve => { const done = () => { clearTimeout(timer); changes.off('change', done); resolve(); }; const timer = setTimeout(done, ms); changes.once('change', done); });
 
   const methods = {
     health: async () => ({ version: VERSION, protocol: PROTOCOL, pid: process.pid, active: [...jobs.values()].filter(job => !terminal(job.status)).length }),
-    catalog: async () => catalog(),
+    catalog: async () => catalog({ models: await models() }),
     sessions: async params => ({ sessions: sessions(params) }),
     start: async params => {
       const client = clientOf(params);
       task(params);
       return view(launch(client, params, settingsOf(params)));
     },
-    // The thread keeps the model, effort, sandbox and folder it last ran with:
-    // `codex exec resume` would otherwise fall back to config.toml.
+    // The thread keeps the model, effort, sandbox and folder it last ran with.
     resume: async params => {
       const client = clientOf(params);
       task(params);
@@ -111,6 +118,13 @@ export function createService({ state = STATE, runner, codexApp = { open: openTh
       if (!terminal(job.status)) { runner.cancel(job); changed(); }
       return view(job);
     },
+    // A message for the turn that is running: Codex reads it before its next step.
+    steer: async params => {
+      const job = own(clientOf(params), params.jobId);
+      if (typeof params.prompt !== 'string' || !params.prompt.trim()) throw new BridgeError('bridge/invalid', 'prompt is required');
+      await runner.steer(job, params.prompt);
+      return view(job);
+    },
     // Once the app loads a thread it keeps the writer lock until it quits and
     // resume is refused meanwhile, so callers open only when the user asks to look.
     open: async params => {
@@ -143,7 +157,7 @@ export function createService({ state = STATE, runner, codexApp = { open: openTh
     methods,
     active: () => [...jobs.values()].some(job => !terminal(job.status)),
     runnerChanged: changed,
-    close() { clearInterval(ticker); clearInterval(sweeper); clearTimeout(saveTimer); atomic(file, { jobs: [...jobs.values()] }); },
+    close() { clearInterval(ticker); clearInterval(sweeper); clearTimeout(saveTimer); runner.close?.(); atomic(file, { jobs: [...jobs.values()] }); },
   };
 }
 
