@@ -9,6 +9,7 @@ import readline from 'node:readline';
 
 const send = message => process.stdout.write(JSON.stringify(message) + '\n');
 const camel = name => name.replace(/-(\w)/g, (_, letter) => letter.toUpperCase());
+const source = process.argv[2] === '--session-source' && process.argv[3] === 'app-server' ? 'appServer' : 'vscode';
 let thread, settings, workspace, slow;
 const finish = (turn, text) => {
   send({ method: 'item/completed', params: { threadId: thread, item: { id: 'item_1', type: 'agentMessage', text } } });
@@ -17,10 +18,13 @@ const finish = (turn, text) => {
 };
 function open(id, params, resumed) {
   if (process.env.CODEX_HOME && fs.existsSync(path.join(process.env.CODEX_HOME, 'held-' + id))) throw { code: -32600, message: `thread ${id} already has an active writer` };
+  if (resumed && !fs.readdirSync(path.join(process.env.CODEX_HOME, 'sessions'), { recursive: true }).some(file => file.endsWith(id + '.jsonl'))) {
+    throw { code: -32600, message: `thread ${id} is not in this Codex home` };
+  }
   thread = id;
   workspace = params.cwd;
   settings = { model: params.model ?? 'gpt-config', sandbox: params.sandbox ?? 'workspace-write', approval: params.approvalPolicy, resumed };
-  return { thread: { id }, model: settings.model, reasoningEffort: 'medium', sandbox: { type: camel(settings.sandbox) }, approvalPolicy: params.approvalPolicy };
+  return { thread: { id, source }, model: settings.model, reasoningEffort: 'medium', sandbox: { type: camel(settings.sandbox) }, approvalPolicy: params.approvalPolicy };
 }
 const methods = {
   initialize: () => ({ userAgent: 'fake-codex' }),
@@ -35,7 +39,7 @@ const methods = {
       const timestamp = new Date().toISOString();
       fs.mkdirSync(directory, { recursive: true });
       const rollout = [
-        { type: 'session_meta', payload: { id: thread, cwd: workspace, timestamp, originator: 'codex-bridge' } },
+        { type: 'session_meta', payload: { id: thread, cwd: workspace, timestamp, originator: 'codex-bridge', source } },
         { type: 'turn_context', payload: { cwd: workspace, model: settings.model, effort: params.effort, sandbox_policy: { type: settings.sandbox } } },
         { type: 'event_msg', payload: { type: 'user_message', message: prompt } },
       ];

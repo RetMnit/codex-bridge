@@ -175,7 +175,7 @@ test('a client deletes the threads it started, with their records, and nothing e
   assert.deepEqual(done.errors, []);
   assert.deepEqual(new Set(done.deleted), new Set([thread, ids.pruned, ids.parent, ids.fork]), 'a parent goes once its fork is gone');
   assert.ok(!exists(ids.pruned) && !exists(ids.parent) && !exists(ids.fork));
-  assert.ok(!sessions({}, workerHome(path.join(temp, 'delete'))).some(item => item.sessionId === thread));
+  assert.ok(!sessions({ limit: 100 }).some(item => item.sessionId === thread));
   await assert.rejects(call('status', { jobId: mine.jobId }), { code: 'bridge/job' }, 'the records of a deleted thread go with it');
   assert.ok(!fs.existsSync(path.join(temp, 'delete', 'jobs', mine.jobId)));
   assert.equal((await service.methods.status({ client: 'beta', jobId: theirs.jobId })).sessionId, other, "another client's records stay");
@@ -200,19 +200,24 @@ test('events answer as soon as something changed', async t => {
   assert.equal(next.jobs.length, 1);
 });
 
-test('new sessions stay in the worker store and resume there after the bridge restarts', async t => {
-  const name = 'isolate';
+test('new sessions use the shared store and old isolated sessions resume in place', async t => {
+  const name = 'shared-store';
   const worker = workerHome(path.join(temp, name));
+  const olderId = '01a1a447-735f-7c70-bc41-421df530f755';
+  const oldSessions = path.join(worker, 'sessions');
+  fs.mkdirSync(oldSessions, { recursive: true });
+  fs.writeFileSync(path.join(oldSessions, `rollout-old-${olderId}.jsonl`), JSON.stringify({ type: 'session_meta',
+    payload: { id: olderId, cwd: temp, timestamp: '2026-11-04T00:00:00Z', source: 'vscode', originator: 'codex-bridge' } }) + '\n');
   const first = makeService(name);
   let sessionId;
   try {
     await assert.rejects(first.call('start', { ...base, mode: 'desktop', prompt: 'x', requestId: 'm' }), { code: 'bridge/invalid' });
-    const job = await first.call('start', { ...base, prompt: 'isolation probe', requestId: 'first', sandbox: 'read-only', effort: 'low' });
+    const job = await first.call('start', { ...base, prompt: 'shared source probe', requestId: 'first', sandbox: 'read-only', effort: 'low' });
     const ended = (await first.call('wait', { jobIds: [job.jobId], timeoutMs: 8000 })).jobs[0];
     assert.equal(ended.status, 'completed');
     sessionId = ended.sessionId;
-    assert.equal(sessions({ query: 'isolation probe' }).length, 0);
-    assert.equal(sessions({ query: 'isolation probe' }, worker)[0].sessionId, sessionId);
+    assert.deepEqual(sessions({ query: 'shared source probe' }).map(({ sessionId, source }) => [sessionId, source]), [[sessionId, 'appServer']]);
+    assert.deepEqual(sessions({}, worker).map(item => item.sessionId), [olderId]);
     await assert.rejects(first.call('open', { jobId: job.jobId }), { code: 'bridge/open' });
     await assert.rejects(first.call('open', { sessionId: THREAD }), { code: 'bridge/open' });
   } finally { first.service.close(); }
@@ -224,6 +229,10 @@ test('new sessions stay in the worker store and resume there after the bridge re
   assert.equal(ended.sessionId, sessionId);
   assert.equal(ended.result, 'resumed: same ID');
   assert.deepEqual(ended.settings, { workspace: temp, model: 'gpt-config', sandbox: 'read-only', effort: 'low' });
+  const old = await resumed.call('resume', { sessionId: olderId, prompt: 'old store', requestId: 'legacy' });
+  const continued = (await resumed.call('wait', { jobIds: [old.jobId], timeoutMs: 8000 })).jobs[0];
+  assert.equal(continued.sessionId, olderId);
+  assert.equal(continued.result, 'resumed: old store');
 });
 
 // The fake Codex processes exit a moment after their jobs end, and hold the folder until then.

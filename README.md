@@ -1,6 +1,6 @@
 # Codex Bridge
 
-A local service that lets agents delegate background work to Codex. Callers can start or resume a session, steer and cancel turns, read results, and delete threads they started. New sessions live in the bridge's own Codex profile and callers view them through their own task UI.
+A local service that lets agents delegate background work to Codex. Callers can start or resume a session, steer and cancel turns, read results, and delete threads they started. New sessions share the existing Codex profile and are tagged as `appServer`, which keeps them out of Desktop's default recent list.
 
 ## Install
 
@@ -12,21 +12,9 @@ cd codex-bridge
 node setup.mjs
 ```
 
-This copies the runtime to `~/.codex-bridge/runtime/<version>` and starts the service. Run it again after updating the checkout.
+Setup downloads and verifies the official standalone app-server for the installed Codex version, then installs the Bridge runtime and starts the service. Run setup again after updating Bridge or Codex to keep the app-server version matched. If you already downloaded the matching official Windows `codex-app-server-package-*.tar.zst`, pass its path to `node setup.mjs` to reuse it. Setup still checks its checksum against the GitHub release.
 
-New background sessions use `~/.codex-bridge/worker` as their Codex home and SQLite directory. If `CODEX_BRIDGE_STATE_DIR` is set, `worker` lives under that directory. Set up a model provider in the worker's `config.toml`, or log in once for that profile. For example, with the default state directory in PowerShell:
-
-```powershell
-$previousCodexHome = $env:CODEX_HOME
-try {
-    $env:CODEX_HOME = Join-Path $env:USERPROFILE '.codex-bridge\worker'
-    codex login
-} finally {
-    $env:CODEX_HOME = $previousCodexHome
-}
-```
-
-Existing sessions stay in their original store and can still be resumed by ID. Finish any jobs in the old bridge before upgrading, then reload callers that cached its installed client.
+New tasks reuse the existing Codex login and model configuration. Sessions created by Bridge 0.5.0 in `~/.codex-bridge/worker` can still be resumed by ID using their original profile. Finish any jobs in the old bridge before upgrading, then reload callers that cached its installed client.
 
 ## Use
 

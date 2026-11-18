@@ -63,7 +63,7 @@ export function createService({ state = STATE, runner, threadLock = threadLocked
     return records.length ? 'This thread was not started through the bridge; only resumed here' : 'This thread was not started through the bridge';
   };
   const deleting = new Set();
-  function launch(client, params, settings, resumeOf, home = worker) {
+  function launch(client, params, settings, resumeOf, home) {
     const existing = [...jobs.values()].find(job => job.client === client && job.requestId === params.requestId);
     if (existing) return existing;
     if (resumeOf && [...jobs.values()].some(job => job.sessionId === resumeOf && !terminal(job.status))) throw new BridgeError('bridge/busy', 'This Codex thread already has a running task');
@@ -88,13 +88,13 @@ export function createService({ state = STATE, runner, threadLock = threadLocked
 
   const methods = {
     health: async () => ({ version: VERSION, protocol: PROTOCOL, pid: process.pid, isolatedStarts: true, active: [...jobs.values()].filter(job => !terminal(job.status)).length }),
-    catalog: async () => catalog({ models: await models(), home: worker }),
+    catalog: async () => catalog({ models: await models() }),
     // With `client`, each thread says whether that client may delete it.
     sessions: async params => {
       const client = params.client === undefined ? undefined : clientOf(params);
-      const legacy = sessions(params).map(item => [item.sessionId, { item, home: undefined }]);
+      const shared = sessions(params).map(item => [item.sessionId, { item, home: undefined }]);
       const isolated = sessions(params, worker).map(item => [item.sessionId, { item, home: worker }]);
-      const found = [...new Map([...legacy, ...isolated]).values()]
+      const found = [...new Map([...shared, ...isolated]).values()]
         .sort((a, b) => String(b.item.createdAt ?? '').localeCompare(String(a.item.createdAt ?? '')))
         .slice(0, params.limit ?? 20);
       return { sessions: found.map(({ item, home }) => client ?
