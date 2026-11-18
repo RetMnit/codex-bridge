@@ -29,7 +29,7 @@ fs.writeFileSync(path.join(process.env.CODEX_HOME, '.codex-global-state.json'), 
 fs.mkdirSync(path.join(temp, 'beta'));
 
 const { createService } = await import('../service/service.mjs');
-const { codexRunner, sessions, threadContext, threadLocked, commandText, THREAD_OPEN } = await import('../lib/codex.mjs');
+const { codexRunner, sessions, threadContext, threadLocked, commandText, THREAD_OPEN, workerHome } = await import('../lib/codex.mjs');
 
 function makeService(name, extra = {}) {
   const state = path.join(temp, name);
@@ -175,6 +175,7 @@ test('a client deletes the threads it started, with their records, and nothing e
   assert.deepEqual(done.errors, []);
   assert.deepEqual(new Set(done.deleted), new Set([thread, ids.pruned, ids.parent, ids.fork]), 'a parent goes once its fork is gone');
   assert.ok(!exists(ids.pruned) && !exists(ids.parent) && !exists(ids.fork));
+  assert.ok(!sessions({}, workerHome(path.join(temp, 'delete'))).some(item => item.sessionId === thread));
   await assert.rejects(call('status', { jobId: mine.jobId }), { code: 'bridge/job' }, 'the records of a deleted thread go with it');
   assert.ok(!fs.existsSync(path.join(temp, 'delete', 'jobs', mine.jobId)));
   assert.equal((await service.methods.status({ client: 'beta', jobId: theirs.jobId })).sessionId, other, "another client's records stay");
@@ -199,20 +200,30 @@ test('events answer as soon as something changed', async t => {
   assert.equal(next.jobs.length, 1);
 });
 
-test('threads open in the Codex app only when asked, and never while a run writes them', async t => {
-  const opened = [];
-  const { service, call } = makeService('open', { codexApp: { open: id => { opened.push(id); return { opened: true }; } } }); t.after(() => service.close());
-  await assert.rejects(call('start', { ...base, mode: 'desktop', prompt: 'x', requestId: 'm' }), { code: 'bridge/invalid' }, 'mode is gone in protocol 2');
-  const slow = await call('start', { ...base, prompt: 'slow a', requestId: 'a' });
-  const quick = await call('start', { ...base, prompt: 'b', requestId: 'b' });
-  await call('wait', { jobIds: [quick.jobId], timeoutMs: 8000 });
-  await new Promise(resolve => setTimeout(resolve, 300));
-  assert.deepEqual(opened, [], 'an ended run is not opened by itself');
-  await call('open', { jobId: quick.jobId });
-  assert.deepEqual(opened, [(await call('status', { jobId: quick.jobId })).sessionId]);
-  await assert.rejects(call('open', { jobId: slow.jobId }), { code: 'bridge/open' });
-  await call('cancel', { jobId: slow.jobId });
-  await call('wait', { jobIds: [slow.jobId], timeoutMs: 8000 });
+test('new sessions stay in the worker store and resume there after the bridge restarts', async t => {
+  const name = 'isolate';
+  const worker = workerHome(path.join(temp, name));
+  const first = makeService(name);
+  let sessionId;
+  try {
+    await assert.rejects(first.call('start', { ...base, mode: 'desktop', prompt: 'x', requestId: 'm' }), { code: 'bridge/invalid' });
+    const job = await first.call('start', { ...base, prompt: 'isolation probe', requestId: 'first', sandbox: 'read-only', effort: 'low' });
+    const ended = (await first.call('wait', { jobIds: [job.jobId], timeoutMs: 8000 })).jobs[0];
+    assert.equal(ended.status, 'completed');
+    sessionId = ended.sessionId;
+    assert.equal(sessions({ query: 'isolation probe' }).length, 0);
+    assert.equal(sessions({ query: 'isolation probe' }, worker)[0].sessionId, sessionId);
+    await assert.rejects(first.call('open', { jobId: job.jobId }), { code: 'bridge/open' });
+    await assert.rejects(first.call('open', { sessionId: THREAD }), { code: 'bridge/open' });
+  } finally { first.service.close(); }
+
+  const resumed = makeService(name); t.after(() => resumed.service.close());
+  assert.deepEqual((await resumed.call('sessions', { limit: 1 })).sessions.map(item => item.sessionId), [sessionId]);
+  const job = await resumed.call('resume', { sessionId, prompt: 'same ID', requestId: 'resume' });
+  const ended = (await resumed.call('wait', { jobIds: [job.jobId], timeoutMs: 8000 })).jobs[0];
+  assert.equal(ended.sessionId, sessionId);
+  assert.equal(ended.result, 'resumed: same ID');
+  assert.deepEqual(ended.settings, { workspace: temp, model: 'gpt-config', sandbox: 'read-only', effort: 'low' });
 });
 
 // The fake Codex processes exit a moment after their jobs end, and hold the folder until then.

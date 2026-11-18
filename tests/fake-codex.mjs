@@ -9,7 +9,7 @@ import readline from 'node:readline';
 
 const send = message => process.stdout.write(JSON.stringify(message) + '\n');
 const camel = name => name.replace(/-(\w)/g, (_, letter) => letter.toUpperCase());
-let thread, settings, slow;
+let thread, settings, workspace, slow;
 const finish = (turn, text) => {
   send({ method: 'item/completed', params: { threadId: thread, item: { id: 'item_1', type: 'agentMessage', text } } });
   send({ method: 'thread/tokenUsage/updated', params: { threadId: thread, tokenUsage: { total: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 2, reasoningOutputTokens: 0 } } } });
@@ -18,6 +18,7 @@ const finish = (turn, text) => {
 function open(id, params, resumed) {
   if (process.env.CODEX_HOME && fs.existsSync(path.join(process.env.CODEX_HOME, 'held-' + id))) throw { code: -32600, message: `thread ${id} already has an active writer` };
   thread = id;
+  workspace = params.cwd;
   settings = { model: params.model ?? 'gpt-config', sandbox: params.sandbox ?? 'workspace-write', approval: params.approvalPolicy, resumed };
   return { thread: { id }, model: settings.model, reasoningEffort: 'medium', sandbox: { type: camel(settings.sandbox) }, approvalPolicy: params.approvalPolicy };
 }
@@ -29,6 +30,17 @@ const methods = {
   'turn/start': params => {
     const turn = 'turn_' + randomUUID();
     const prompt = params.input[0].text;
+    if (!settings.resumed) {
+      const directory = path.join(process.env.CODEX_HOME, 'sessions');
+      const timestamp = new Date().toISOString();
+      fs.mkdirSync(directory, { recursive: true });
+      const rollout = [
+        { type: 'session_meta', payload: { id: thread, cwd: workspace, timestamp, originator: 'codex-bridge' } },
+        { type: 'turn_context', payload: { cwd: workspace, model: settings.model, effort: params.effort, sandbox_policy: { type: settings.sandbox } } },
+        { type: 'event_msg', payload: { type: 'user_message', message: prompt } },
+      ];
+      fs.writeFileSync(path.join(directory, `rollout-${timestamp.replaceAll(':', '-')}-${thread}.jsonl`), rollout.map(line => JSON.stringify(line)).join('\n') + '\n');
+    }
     setImmediate(() => {
       send({ method: 'turn/started', params: { threadId: thread, turn: { id: turn } } });
       send({ method: 'item/completed', params: { threadId: 'someone-else', item: { id: 'x', type: 'agentMessage', text: 'a sub-agent thread' } } });

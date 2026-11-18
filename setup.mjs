@@ -5,6 +5,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { ROOT, STATE, VERSION, atomic, readJson } from './lib/common.mjs';
+import { workerHome } from './lib/codex.mjs';
+
+fs.mkdirSync(workerHome(STATE), { recursive: true });
 
 const target = path.join(STATE, 'runtime', VERSION);
 const staging = target + '.staging';
@@ -22,7 +25,7 @@ const keep = new Set([path.basename(target), previous.root && path.basename(prev
 for (const name of fs.readdirSync(path.join(STATE, 'runtime'))) if (!keep.has(name)) fs.rmSync(path.join(STATE, 'runtime', name), { recursive: true, force: true });
 
 // A running service of the same version still runs the old copy: stop it while idle.
-const { connect } = await import(new URL('file:///' + path.join(target, 'lib/client.mjs').replaceAll('\\', '/')).href);
+const { connect } = await import(pathToFileURL(path.join(target, 'lib/client.mjs')).href);
 let restarted = false;
 const info = readJson(path.join(STATE, 'service.json'), null);
 if (info?.url) {

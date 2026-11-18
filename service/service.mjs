@@ -6,10 +6,12 @@ import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypt
 import { EventEmitter } from 'node:events';
 import { pathToFileURL } from 'node:url';
 import { STATE, VERSION, PROTOCOL, BridgeError, atomic, readJson, now, summary, terminal, clientOf } from '../lib/common.mjs';
-import { codexRunner, catalog, sessions, threadContext, threadLocked, threadOrigin, openThread, projectList, SANDBOXES, THREAD_OPEN, THREAD_ID } from '../lib/codex.mjs';
+import { codexRunner, catalog, sessions, workerHome, threadHome, threadContext, threadLocked, threadOrigin, projectList, SANDBOXES, THREAD_OPEN, WORKER_THREAD_OPEN, THREAD_ID } from '../lib/codex.mjs';
 
 const RETAIN_DAYS = 30, RETAIN_PER_CLIENT = 500;
-export function createService({ state = STATE, runner, codexApp = { open: openThread }, threadLock = threadLocked, origin = threadOrigin, clock = Date.now } = {}) {
+export function createService({ state = STATE, runner, threadLock = threadLocked, origin = threadOrigin, clock = Date.now } = {}) {
+  const worker = workerHome(state);
+  const lockMessage = home => home === worker ? WORKER_THREAD_OPEN : THREAD_OPEN;
   const file = path.join(state, 'jobs.json');
   const jobs = new Map((readJson(file, { jobs: [] }).jobs ?? []).map(job => [job.jobId, job]));
   const changes = new EventEmitter(); changes.setMaxListeners(200);
@@ -41,9 +43,7 @@ export function createService({ state = STATE, runner, codexApp = { open: openTh
     return value;
   }
   const task = params => {
-    // Protocol 1 had a desktop mode that opened each ended run in the Codex app;
-    // the app then holds the thread's writer lock until it quits, so it was dropped.
-    if (params.mode !== undefined) throw new BridgeError('bridge/invalid', 'mode was removed in protocol 2: runs are always hidden; use open to show a thread');
+    if (params.mode !== undefined) throw new BridgeError('bridge/invalid', 'Codex Bridge only runs in the background');
     for (const key of ['prompt', 'requestId']) if (typeof params[key] !== 'string' || !params[key].trim()) throw new BridgeError('bridge/invalid', key + ' is required');
     if (params.title !== undefined && typeof params.title !== 'string') throw new BridgeError('bridge/invalid', 'Invalid title');
   };
@@ -55,19 +55,19 @@ export function createService({ state = STATE, runner, codexApp = { open: openTh
   // A client may delete a thread it started. Once its records are pruned (30 days),
   // a thread started by the bridge (originator "codex-bridge") still counts, unless
   // another client has records of it. The user's own threads never do.
-  const ownerProblem = (client, sessionId, originator) => {
+  const ownerProblem = (client, sessionId, home, originator) => {
     const records = [...jobs.values()].filter(job => job.sessionId === sessionId);
     if (records.some(job => job.client !== client)) return 'Another caller of the bridge has tasks on this thread';
     if (records.some(job => !job.resumeOf)) return undefined;
-    if ((originator ?? origin(sessionId)?.originator) === 'codex-bridge') return undefined;
+    if ((originator ?? origin(sessionId, home)?.originator) === 'codex-bridge') return undefined;
     return records.length ? 'This thread was not started through the bridge; only resumed here' : 'This thread was not started through the bridge';
   };
   const deleting = new Set();
-  function launch(client, params, settings, resumeOf) {
+  function launch(client, params, settings, resumeOf, home = worker) {
     const existing = [...jobs.values()].find(job => job.client === client && job.requestId === params.requestId);
     if (existing) return existing;
     if (resumeOf && [...jobs.values()].some(job => job.sessionId === resumeOf && !terminal(job.status))) throw new BridgeError('bridge/busy', 'This Codex thread already has a running task');
-    if (resumeOf && threadLock(resumeOf)) throw new BridgeError('codex/thread-open', THREAD_OPEN);
+    if (resumeOf && threadLock(resumeOf, home)) throw new BridgeError('codex/thread-open', lockMessage(home));
     if (resumeOf && deleting.has(resumeOf)) throw new BridgeError('bridge/busy', 'This Codex thread is being deleted');
     const job = {
       jobId: 'codex-' + randomUUID(), client, requestId: params.requestId,
@@ -75,7 +75,7 @@ export function createService({ state = STATE, runner, codexApp = { open: openTh
       status: 'starting', createdAt: now(), settings, activity: [], ...(resumeOf ? { resumeOf, sessionId: resumeOf } : {}),
     };
     jobs.set(job.jobId, job);
-    try { runner.start(job); } catch (error) { job.status = 'failed'; job.error = error.message; job.finishedAt = now(); }
+    try { runner.start(job, home); } catch (error) { job.status = 'failed'; job.error = error.message; job.finishedAt = now(); }
     changed();
     return job;
   }
@@ -87,13 +87,18 @@ export function createService({ state = STATE, runner, codexApp = { open: openTh
   const waitChange = ms => new Promise(resolve => { const done = () => { clearTimeout(timer); changes.off('change', done); resolve(); }; const timer = setTimeout(done, ms); changes.once('change', done); });
 
   const methods = {
-    health: async () => ({ version: VERSION, protocol: PROTOCOL, pid: process.pid, active: [...jobs.values()].filter(job => !terminal(job.status)).length }),
-    catalog: async () => catalog({ models: await models() }),
+    health: async () => ({ version: VERSION, protocol: PROTOCOL, pid: process.pid, isolatedStarts: true, active: [...jobs.values()].filter(job => !terminal(job.status)).length }),
+    catalog: async () => catalog({ models: await models(), home: worker }),
     // With `client`, each thread says whether that client may delete it.
     sessions: async params => {
       const client = params.client === undefined ? undefined : clientOf(params);
-      const found = sessions(params);
-      return { sessions: client ? found.map(item => ({ ...item, deletable: !ownerProblem(client, item.sessionId, item.originator) })) : found };
+      const legacy = sessions(params).map(item => [item.sessionId, { item, home: undefined }]);
+      const isolated = sessions(params, worker).map(item => [item.sessionId, { item, home: worker }]);
+      const found = [...new Map([...legacy, ...isolated]).values()]
+        .sort((a, b) => String(b.item.createdAt ?? '').localeCompare(String(a.item.createdAt ?? '')))
+        .slice(0, params.limit ?? 20);
+      return { sessions: found.map(({ item, home }) => client ?
+        { ...item, deletable: !ownerProblem(client, item.sessionId, home, item.originator) } : item) };
     },
     start: async params => {
       const client = clientOf(params);
@@ -105,10 +110,11 @@ export function createService({ state = STATE, runner, codexApp = { open: openTh
       const client = clientOf(params);
       task(params);
       if (typeof params.sessionId !== 'string' || !params.sessionId.trim()) throw new BridgeError('bridge/invalid', 'sessionId is required');
-      const context = threadContext(params.sessionId);
+      const home = threadHome(params.sessionId, worker);
+      const context = threadContext(params.sessionId, home);
       if (!context.workspace || !fs.existsSync(context.workspace)) throw new BridgeError('bridge/workspace', 'The thread\'s folder no longer exists: ' + context.workspace);
       const settings = Object.fromEntries(Object.entries({ workspace: context.workspace, model: context.model, effort: context.effort, sandbox: context.sandbox }).filter(([, value]) => value));
-      return view(launch(client, params, settings, params.sessionId));
+      return view(launch(client, params, settings, params.sessionId, home));
     },
     list: async params => { const client = clientOf(params); return { cursor, jobs: [...jobs.values()].filter(job => job.client === client).map(job => view(job)) }; },
     status: async params => view(own(clientOf(params), params.jobId), { full: true }),
@@ -147,39 +153,42 @@ export function createService({ state = STATE, runner, codexApp = { open: openTh
       const client = clientOf(params);
       const ids = params.sessionIds;
       if (!Array.isArray(ids) || !ids.length || ids.length > 100 || ids.some(id => typeof id !== 'string' || !THREAD_ID.test(id))) throw new BridgeError('bridge/invalid', 'sessionIds must be 1 to 100 Codex thread IDs');
-      const errors = [], allowed = [];
+      const errors = [], allowed = new Map();
       for (const id of new Set(ids)) {
         const refuse = (code, message) => errors.push({ sessionId: id, code, message });
-        const problem = ownerProblem(client, id);
+        const home = threadHome(id, worker);
+        const problem = ownerProblem(client, id, home);
         if (problem) refuse('bridge/not-owner', problem);
         else if (deleting.has(id) || [...jobs.values()].some(job => job.sessionId === id && !terminal(job.status))) refuse('bridge/busy', 'This thread has a running task');
-        else if (threadLock(id)) refuse('codex/thread-open', 'The Codex app has this thread loaded; quit the Codex app completely, or delete it there');
-        else allowed.push(id);
+        else if (threadLock(id, home)) refuse('codex/thread-open', lockMessage(home));
+        else {
+          if (!allowed.has(home)) allowed.set(home, []);
+          allowed.get(home).push(id);
+          deleting.add(id);
+        }
       }
-      if (!allowed.length) return { deleted: [], errors };
-      for (const id of allowed) deleting.add(id);
+      const gone = new Set();
       try {
-        const outcome = await runner.deleteThreads(allowed);
-        const gone = new Set(outcome.deleted);
+        for (const [home, ids] of allowed) {
+          try {
+            const outcome = await runner.deleteThreads(ids, home);
+            for (const id of outcome.deleted) gone.add(id);
+            errors.push(...outcome.errors);
+          } catch (error) {
+            for (const id of ids) errors.push({ sessionId: id, code: error.code ?? 'codex/error', message: error.message });
+          }
+        }
         for (const job of [...jobs.values()]) {
           if (!gone.has(job.sessionId)) continue;
           jobs.delete(job.jobId);
           fs.rmSync(path.join(state, 'jobs', job.jobId), { recursive: true, force: true });
         }
         if (gone.size) changed();
-        return { deleted: outcome.deleted, errors: [...errors, ...outcome.errors] };
-      } finally { for (const id of allowed) deleting.delete(id); }
+        return { deleted: [...gone], errors };
+      } finally { for (const ids of allowed.values()) for (const id of ids) deleting.delete(id); }
     },
-    // Once the app loads a thread it keeps the writer lock until it quits and
-    // resume is refused meanwhile, so callers open only when the user asks to look.
-    open: async params => {
-      const client = clientOf(params);
-      const job = params.jobId ? own(client, params.jobId) : null;
-      const sessionId = job?.sessionId ?? params.sessionId;
-      if (!sessionId) throw new BridgeError('bridge/open', 'This task has no thread yet');
-      if (job && !terminal(job.status)) throw new BridgeError('bridge/open', 'The Codex app cannot load a thread while this run writes it; open it when the run ends');
-      return codexApp.open(sessionId);
-    },
+    // Keep a useful response for older callers that still offer the Desktop action.
+    open: async () => { throw new BridgeError('bridge/open', 'Opening Bridge sessions in Codex Desktop is no longer supported. View the task in the calling agent.'); },
   };
 
   function cleanup() {
